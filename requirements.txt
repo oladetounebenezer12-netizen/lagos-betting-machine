@@ -1,0 +1,11 @@
+streamlit
+numpy
+pandas
+requests
+python-dotenv
+scipy
+scikit-learn
+statsmodels
+xgboost
+pymc
+arviz
