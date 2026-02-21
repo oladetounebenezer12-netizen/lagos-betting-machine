@@ -612,4 +612,15 @@ def predict_match(home_id, away_id, league_id, season):
         "confidence": confidence,
         "cs_groups": cs_groups
     }
-​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​
+​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​import re
+
+with open("streamlit_app.py", "r", encoding="utf-8") as f:
+    content = f.read()
+
+# Remove zero-width spaces and similar invisibles
+cleaned = re.sub(r'[\u200b\u200c\u200d\ufeff]', '', content)
+
+with open("streamlit_app.py", "w", encoding="utf-8") as f:
+    f.write(cleaned)
+
+print("File cleaned! Commit and push to GitHub.")
