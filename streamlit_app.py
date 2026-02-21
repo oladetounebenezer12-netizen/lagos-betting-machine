@@ -612,4 +612,4 @@ def predict_match(home_id, away_id, league_id, season):
         "confidence": confidence,
         "cs_groups": cs_groups
     }
-```​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​
+​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​​
