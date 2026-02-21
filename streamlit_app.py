@@ -14,6 +14,10 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 import torch.nn.functional as F
+from prophet import Prophet
+from statsmodels.tsa.arima.model import ARIMA
+from statsmodels.tsa.statespace.sarimax import SARIMAX
+from statsmodels.tsa.vector_ar.var_model import VAR
 
 st.set_page_config(page_title="Lagos Betting Machine", layout="centered")
 
@@ -41,7 +45,7 @@ class APISportsClient:
         return r.json() if r.status_code == 200 else None
 
     def get_historical_df(self, league_id, season):
-        fixtures_data = self._get("fixtures?league={league_id}&season={season}".format(league_id=league_id, season=season))
+        fixtures_data = self._get(f"fixtures?league={league_id}&season={season}")
         if not fixtures_data or not fixtures_data['response']:
             return pd.DataFrame()
         df = []
@@ -74,6 +78,8 @@ def load_fixtures():
     for f in fixtures:
         df.append({
             'league': f['league']['name'],
+            'league_id': f['league']['id'],
+            'season': f['league']['season'],
             'home': f['teams']['home']['name'],
             'away': f['teams']['away']['name'],
             'fixture_id': f['fixture']['id'],
@@ -112,9 +118,15 @@ else:
         match_row = match_list.iloc[match_options.tolist().index(selected_match)]
         home = match_row['home']
         away = match_row['away']
+        league_id = match_row['league_id']
+        season = match_row['season']
+
+        # Get historical data
+        client = APISportsClient()
+        historical_df = client.get_historical_df(league_id, season)
 
         # Run engine
-        result = predict_match(home, away)  # Function from previous code
+        result = predict_match(home, away, historical_df)
 
         st.success(f"**{home} vs {away}**")
         
@@ -369,14 +381,179 @@ def nn_adjust_lambda(features):
         adjustment = nn_model(X).item()
     return adjustment
 
-# Updated prediction function with Dixon-Coles, XGBoost, Random Forest, and Neural Network
-def predict_match(home, away):
+# LSTM Integration for Time Series
+class LSTMNN(nn.Module):
+    def __init__(self, input_size=1, hidden_size=64, num_layers=1):
+        super(LSTMNN, self).__init__()
+        self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True)
+        self.fc = nn.Linear(hidden_size, 1)
+
+    def forward(self, x):
+        out, _ = self.lstm(x)
+        out = self.fc(out[:, -1, :])
+        return out
+
+def train_lstm_model(historical_df):
+    seq_len = 5
+    sequences = []
+    targets = []
+    if not historical_df.empty:
+        teams = set(historical_df['HomeTeam']) | set(historical_df['AwayTeam'])
+        for team in teams:
+            goals = []
+            for _, row in historical_df.sort_values('Date').iterrows():
+                if row['HomeTeam'] == team:
+                    goals.append(row['FTHG'])
+                elif row['AwayTeam'] == team:
+                    goals.append(row['FTAG'])
+            if len(goals) > seq_len:
+                for i in range(len(goals) - seq_len):
+                    sequences.append(goals[i:i+seq_len])
+                    targets.append(goals[i+seq_len])
+    
+    if not sequences:
+        # Dummy data if no historical sequences
+        sequences = np.random.rand(100, seq_len)
+        targets = np.random.rand(100)
+    
+    X = torch.tensor(sequences, dtype=torch.float32).unsqueeze(-1)  # (samples, seq_len, 1)
+    y = torch.tensor(targets, dtype=torch.float32).unsqueeze(1)
+    dataset = TensorDataset(X, y)
+    loader = DataLoader(dataset, batch_size=32, shuffle=True)
+    
+    model = LSTMNN()
+    optimizer = optim.Adam(model.parameters(), lr=0.001)
+    criterion = nn.MSELoss()
+    
+    for epoch in range(50):
+        for batch_x, batch_y in loader:
+            optimizer.zero_grad()
+            output = model(batch_x)
+            loss = criterion(output, batch_y)
+            loss.backward()
+            optimizer.step()
+    
+    return model
+
+def lstm_adjust_lambda(model, team, historical_df):
+    seq_len = 5
+    goals = []
+    if not historical_df.empty:
+        for _, row in historical_df.sort_values('Date').iterrows():
+            if row['HomeTeam'] == team:
+                goals.append(row['FTHG'])
+            elif row['AwayTeam'] == team:
+                goals.append(row['FTAG'])
+    if len(goals) < seq_len:
+        return 0.0
+    last_seq = goals[-seq_len:]
+    X = torch.tensor([last_seq], dtype=torch.float32).unsqueeze(-1)  # (1, seq_len, 1)
+    model.eval()
+    with torch.no_grad():
+        adjustment = model(X).item()
+    return adjustment
+
+# Prophet Forecasting Integration
+def prophet_adjust_lambda(team, historical_df):
+    team_goals = []
+    for idx, row in historical_df.iterrows():
+        if row['HomeTeam'] == team:
+            team_goals.append({'ds': row['Date'], 'y': row['FTHG']})
+        elif row['AwayTeam'] == team:
+            team_goals.append({'ds': row['Date'], 'y': row['FTAG']})
+    if len(team_goals) < 2:
+        return 0.0
+    df_prophet = pd.DataFrame(team_goals)
+    m = Prophet(yearly_seasonality=False, weekly_seasonality=False, daily_seasonality=False)
+    m.fit(df_prophet)
+    future = m.make_future_dataframe(periods=1)
+    forecast = m.predict(future)
+    adjustment = forecast['yhat'].iloc[-1]
+    return adjustment
+
+# ARIMA Forecasting Integration
+def arima_adjust_lambda(team, historical_df):
+    goals = []
+    dates = []
+    for _, row in historical_df.sort_values('Date').iterrows():
+        if row['HomeTeam'] == team:
+            goals.append(row['FTHG'])
+            dates.append(row['Date'])
+        elif row['AwayTeam'] == team:
+            goals.append(row['FTAG'])
+            dates.append(row['Date'])
+    if len(goals) < 5:  # Minimum data points for ARIMA
+        return 0.0
+    df_arima = pd.DataFrame({'y': goals}, index=dates)
+    try:
+        model = ARIMA(df_arima['y'], order=(1, 1, 1))  # Simple ARIMA order; can be tuned
+        model_fit = model.fit()
+        forecast = model_fit.forecast(steps=1)
+        adjustment = forecast.iloc[0]
+    except:
+        adjustment = 0.0
+    return adjustment
+
+# SARIMA Forecasting Integration for Seasonality
+def sarima_adjust_lambda(team, historical_df):
+    goals = []
+    dates = []
+    for _, row in historical_df.sort_values('Date').iterrows():
+        if row['HomeTeam'] == team:
+            goals.append(row['FTHG'])
+            dates.append(row['Date'])
+        elif row['AwayTeam'] == team:
+            goals.append(row['FTAG'])
+            dates.append(row['Date'])
+    if len(goals) < 12:  # Minimum data points for SARIMA with seasonality
+        return 0.0
+    df_sarima = pd.DataFrame({'y': goals}, index=dates)
+    try:
+        # SARIMA order (p,d,q)(P,D,Q,s) - assuming weekly seasonality (s=7)
+        model = SARIMAX(df_sarima['y'], order=(1, 1, 1), seasonal_order=(1, 1, 1, 7))
+        model_fit = model.fit(disp=False)
+        forecast = model_fit.forecast(steps=1)
+        adjustment = forecast.iloc[0]
+    except:
+        adjustment = 0.0
+    return adjustment
+
+# VAR Forecasting Integration
+def var_adjust_lambda(team, historical_df):
+    scored = []
+    conceded = []
+    dates = []
+    for _, row in historical_df.sort_values('Date').iterrows():
+        if row['HomeTeam'] == team:
+            scored.append(row['FTHG'])
+            conceded.append(row['FTAG'])
+            dates.append(row['Date'])
+        elif row['AwayTeam'] == team:
+            scored.append(row['FTAG'])
+            conceded.append(row['FTHG'])
+            dates.append(row['Date'])
+    if len(scored) < 5:  # Minimum data points for VAR
+        return 0.0
+    df_var = pd.DataFrame({'scored': scored, 'conceded': conceded}, index=dates)
+    try:
+        model = VAR(df_var)
+        model_fit = model.fit(maxlags=1, ic='aic')  # Simple lag=1; can be tuned
+        forecast = model_fit.forecast(df_var.values[-model_fit.k_ar:], steps=1)
+        adjustment = forecast[0][0]  # Forecasted scored goals
+    except:
+        adjustment = 0.0
+    return adjustment
+
+# Updated prediction function with Dixon-Coles, XGBoost, Random Forest, Neural Network, LSTM, Prophet, ARIMA, SARIMA, and VAR
+def predict_match(home, away, historical_df):
     # Simulated but realistic (replace with real lambda calc later)
     lambda_home = 1.6
     lambda_away = 1.3
 
+    # Placeholder features (in real use, derive from historical data)
+    features = [1.0, 1.0, 1.0, 1.0, 1.0, 1.0]  # e.g., last 5 goals + form
+
     # XGBoost adjustment
-    features = [1.0, 1.0, 1.0, 1.0, 1.0, 1.0]  # Placeholder features
     lambda_home += xgb_adjust_lambda(features)
     lambda_away += xgb_adjust_lambda(features)
     
@@ -388,20 +565,35 @@ def predict_match(home, away):
     lambda_home += nn_adjust_lambda(features)
     lambda_away += nn_adjust_lambda(features)
     
+    # Train LSTM with historical data
+    lstm_m = train_lstm_model(historical_df)
+    # LSTM adjustment (time series)
+    lambda_home += lstm_adjust_lambda(lstm_m, home, historical_df)
+    lambda_away += lstm_adjust_lambda(lstm_m, away, historical_df)
+    
+    # Prophet adjustment
+    lambda_home += prophet_adjust_lambda(home, historical_df)
+    lambda_away += prophet_adjust_lambda(away, historical_df)
+    
+    # ARIMA adjustment
+    lambda_home += arima_adjust_lambda(home, historical_df)
+    lambda_away += arima_adjust_lambda(away, historical_df)
+    
+    # SARIMA adjustment
+    lambda_home += sarima_adjust_lambda(home, historical_df)
+    lambda_away += sarima_adjust_lambda(away, historical_df)
+    
+    # VAR adjustment
+    lambda_home += var_adjust_lambda(home, historical_df)
+    lambda_away += var_adjust_lambda(away, historical_df)
+    
     # Poisson matrix
     goals = np.arange(0, 11)
     prob_matrix = np.outer(poisson.pmf(goals, lambda_home), poisson.pmf(goals, lambda_away))
     prob_matrix /= prob_matrix.sum()
     
-    # Dixon-Coles adjustment (using dummy df for fit)
-    dummy_df = pd.DataFrame({
-        'Date': pd.date_range(start='2026-01-01', periods=10),
-        'HomeTeam': [home, away] * 5,
-        'AwayTeam': [away, home] * 5,
-        'FTHG': np.random.randint(0, 4, 10),
-        'FTAG': np.random.randint(0, 4, 10)
-    })
-    dc_params = fit_dixon_coles_model(dummy_df)
+    # Dixon-Coles adjustment
+    dc_params = fit_dixon_coles_model(historical_df)
     dc_result = predict_dixon_coles(dc_params, home, away)
     
     # Average with Poisson
@@ -423,4 +615,4 @@ def predict_match(home, away):
         "fh_home": 32,
         "confidence": 78,
         "cs_groups": {"Group 1": "26%", "Group 2": "24%", "Group 3": "25%", "Group 4": "25%"}
-    }
+    } 
